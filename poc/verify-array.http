@@ -1,0 +1,223 @@
+# Read-only Elasticsearch 8 requests for Kibana Dev Tools.
+# Replace EVERY POC_INDEX with the concrete development index name.
+# Change all example dates together to a window present in your test data.
+# Run after the backfill completes. These requests do not execute the backfill.
+# Check timed_out=false and _shards.failed=0 in each search response.
+# Validation here concerns Elasticsearch responses; it does not establish how
+# the custom Kibana fork renders a chart or whether its UI supports this field.
+
+
+# 1. Inspect the materialized field mapping. Expect type=date for this POC.
+GET /POC_INDEX/_mapping/field/forensic_all_dates
+
+
+# 2. Inspect up to five populated documents. _source preserves the original
+# fields for comparison; fields returns the materialized dates in UTC format.
+# The selected documents are a sample, not a complete correctness check.
+GET /POC_INDEX/_search?allow_partial_search_results=false
+{
+  "size": 5,
+  "track_total_hits": true,
+  "_source": true,
+  "fields": [
+    {
+      "field": "forensic_all_dates",
+      "format": "strict_date_optional_time"
+    }
+  ],
+  "query": {
+    "exists": {
+      "field": "forensic_all_dates"
+    }
+  }
+}
+
+
+# 3. Count coverage across the entire concrete index.
+# hits.total.value = all documents; the two filter counts partition that total.
+# Missing may be legitimate when a document has no supported source date.
+# exists does not prove that every source timestamp was copied successfully.
+GET /POC_INDEX/_search?allow_partial_search_results=false
+{
+  "size": 0,
+  "track_total_hits": true,
+  "query": {
+    "match_all": {}
+  },
+  "aggs": {
+    "array_coverage": {
+      "filters": {
+        "filters": {
+          "with_indexed_dates": {
+            "exists": {
+              "field": "forensic_all_dates"
+            }
+          },
+          "without_indexed_dates": {
+            "bool": {
+              "must_not": [
+                {
+                  "exists": {
+                    "field": "forensic_all_dates"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+
+# 4. UTC window aligned to hourly boundaries: [09:00, 12:00).
+# Keep both endpoints in ONE range so the same array value must satisfy them.
+# Expected bucket starts: 09:00, 10:00, 11:00, including empty buckets.
+# extended_bounds.max is the last desired bucket START: 11:00.
+# hard_bounds.max is EXCLUSIVE for bucket starts: use 12:00, not 11:00.
+# Every retained hourly bucket is entirely inside this aligned window.
+# doc_count counts documents per bucket, not the number of dates in the array.
+# A document can count in several buckets; do not equate their sum to hits.total.
+GET /POC_INDEX/_search?allow_partial_search_results=false
+{
+  "size": 0,
+  "track_total_hits": true,
+  "query": {
+    "range": {
+      "forensic_all_dates": {
+        "gte": "2026-09-20T09:00:00Z",
+        "lt": "2026-09-20T12:00:00Z",
+        "format": "strict_date_optional_time"
+      }
+    }
+  },
+  "aggs": {
+    "documents_by_hour": {
+      "date_histogram": {
+        "field": "forensic_all_dates",
+        "fixed_interval": "1h",
+        "time_zone": "UTC",
+        "format": "strict_date_optional_time",
+        "min_doc_count": 0,
+        "extended_bounds": {
+          "min": "2026-09-20T09:00:00Z",
+          "max": "2026-09-20T11:00:00Z"
+        },
+        "hard_bounds": {
+          "min": "2026-09-20T09:00:00Z",
+          "max": "2026-09-20T12:00:00Z"
+        }
+      }
+    }
+  }
+}
+
+
+# 5. UTC window with partial first/last hours: [09:45, 11:15).
+# A range query selects DOCUMENTS; it does not trim each document's date array.
+# The raw histogram can therefore overcount its 09:00 and 11:00 buckets using
+# values outside the requested window from documents matching another value.
+# hard_bounds restricts bucket starts, not the individual values in a bucket.
+# The sibling filters compute exact document counts for the two partial hours.
+# For a corrected three-bucket series:
+#   09:00 count = boundary_counts.buckets.first_0945_to_1000.doc_count
+#   10:00 count = raw_documents_by_hour bucket 10:00 doc_count
+#   11:00 count = boundary_counts.buckets.last_1100_to_1115.doc_count
+# REPLACE the first/last histogram counts; do not ADD the correction counts.
+# This file only returns those values; a consumer must apply the replacement.
+# The first/last buckets represent 15 minutes each; the middle represents 60.
+# A document may count in multiple buckets, so their sum is not a distinct total.
+GET /POC_INDEX/_search?allow_partial_search_results=false
+{
+  "size": 0,
+  "track_total_hits": true,
+  "query": {
+    "range": {
+      "forensic_all_dates": {
+        "gte": "2026-09-20T09:45:00Z",
+        "lt": "2026-09-20T11:15:00Z",
+        "format": "strict_date_optional_time"
+      }
+    }
+  },
+  "aggs": {
+    "raw_documents_by_hour": {
+      "date_histogram": {
+        "field": "forensic_all_dates",
+        "fixed_interval": "1h",
+        "time_zone": "UTC",
+        "format": "strict_date_optional_time",
+        "min_doc_count": 0,
+        "extended_bounds": {
+          "min": "2026-09-20T09:00:00Z",
+          "max": "2026-09-20T11:00:00Z"
+        },
+        "hard_bounds": {
+          "min": "2026-09-20T09:00:00Z",
+          "max": "2026-09-20T12:00:00Z"
+        }
+      }
+    },
+    "boundary_counts": {
+      "filters": {
+        "filters": {
+          "first_0945_to_1000": {
+            "range": {
+              "forensic_all_dates": {
+                "gte": "2026-09-20T09:45:00Z",
+                "lt": "2026-09-20T10:00:00Z",
+                "format": "strict_date_optional_time"
+              }
+            }
+          },
+          "last_1100_to_1115": {
+            "range": {
+              "forensic_all_dates": {
+                "gte": "2026-09-20T11:00:00Z",
+                "lt": "2026-09-20T11:15:00Z",
+                "format": "strict_date_optional_time"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# 6. Show what the new search adds: an array date matches but @timestamp does not.
+# A missing @timestamp also satisfies must_not; inspect originals in the hits.
+GET /POC_INDEX/_search?allow_partial_search_results=false
+{
+  "size": 10,
+  "track_total_hits": true,
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "range": {
+            "forensic_all_dates": {
+              "gte": "2026-09-20T09:00:00Z",
+              "lt": "2026-09-20T12:00:00Z"
+            }
+          }
+        }
+      ],
+      "must_not": [
+        {
+          "range": {
+            "@timestamp": {
+              "gte": "2026-09-20T09:00:00Z",
+              "lt": "2026-09-20T12:00:00Z"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
+
+# References:
+# https://www.elastic.co/guide/en/elasticsearch/reference/8.19/search-aggregations-bucket-datehistogram-aggregation.html
+# https://github.com/elastic/elasticsearch/blob/v8.19.0/server/src/main/java/org/elasticsearch/search/aggregations/bucket/histogram/LongBounds.java#L206-L214
