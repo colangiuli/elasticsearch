@@ -20,6 +20,8 @@ Locate and report the files/functions responsible for time state, table queries,
 
 Public Kibana 2 is only a reference. Its `lib/query.rb` hardcodes a range on `@timestamp`; `DateHistogram` accepts a field but emits old `facets`. Its graph endpoint uses the default field, and `public/lib/js/ajax.js` reads facet entries and plots time/count pairs. Your fork already works with ES8, so find its actual adaptation before changing anything. Do not reinstall the historical API or assume these paths are unchanged.
 
+A development request shared on 2 October 2026 establishes a narrower starting point: the fork already generates `size: 0`, `aggs["0"].filter.bool.must` and `aggs["0"].aggs.dh.date_histogram`. Changing the panel field changes `dh.date_histogram.field` to `forensic_all_dates`, while TWO range clauses in the parent filter still target `@timestamp`. The interval is `fixed_interval: "30d"`. Preserve this working request/response structure where practical; do not introduce a new aggregation adapter unless actual response parsing requires it. Trace the origin of both ranges and distinguish automatic time restrictions from intentional analyst field constraints. No response or rendered chart has yet been inspected.
+
 Inspect a representative request and response when available, or establish their shape from code and fixtures. Distinguish code inspection, fixture tests and live verification in your report. If repository access is missing, state that blocker instead of claiming implementation.
 
 ## Implement the smallest coherent change

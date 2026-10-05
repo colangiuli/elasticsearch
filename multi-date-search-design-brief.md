@@ -76,6 +76,8 @@ Use Elasticsearch 8 `date_histogram` on `forensic_all_dates`. Each bar means **d
 
 The public Kibana 2 code hardcodes the base time filter to `@timestamp`, builds an old `facets` request and renders returned time/count pairs. The renderer does not inspect document arrays. The proposed integration is to parameterize the temporal field and adapt modern aggregation buckets to the renderer's existing input, wherever the fork's current adapter makes this simplest. Upstream behavior is a clue, not proof of how your fork works. [Historical query code](https://github.com/rashidkpc/kibana2/blob/a7cdc7426205dccc782ee291dbf162f7a44bb1dc/lib/query.rb#L39-L163), [historical renderer](https://github.com/rashidkpc/kibana2/blob/a7cdc7426205dccc782ee291dbf162f7a44bb1dc/public/lib/js/ajax.js#L1313-L1351)
 
+**Development evidence from 2 October 2026:** a supplied request shows that the fork already uses native `aggs`, and changing the histogram setting selects `forensic_all_dates`. However, both parent range filters remain on `@timestamp`. The immediate integration work is therefore to trace and adapt the temporal filters while preserving the existing aggregation structure. The screenshot does not establish the response or rendering behavior. [Read-only comparison requests](./poc/histogram-from-observed-query.http)
+
 Two details require explicit verification:
 
 - **Count semantics:** historical facets counted timestamp values; ES8 `doc_count` counts documents per bucket. Label the new mode accordingly and verify the fork's actual request and response. [Historical facet implementation](https://github.com/elastic/elasticsearch/blob/v0.90.13/src/main/java/org/elasticsearch/search/facet/datehistogram/CountDateHistogramFacetExecutor.java)

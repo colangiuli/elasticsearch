@@ -13,6 +13,7 @@ import os
 import re
 import ssl
 import sys
+from time import monotonic
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
@@ -179,6 +180,13 @@ def make_updates(hits, fields, target, routing_required):
     return "\n".join(lines) + ("\n" if lines else ""), previews, skipped
 
 
+def progress(stats, started):
+    elapsed = max(monotonic() - started, 0.001)
+    return {**stats, "elapsed_seconds": round(elapsed, 3),
+            "scanned_per_second": round(stats["scanned"] / elapsed, 1),
+            "updated_per_second": round(stats["updated"] / elapsed, 1)}
+
+
 def run(client, args):
     if not re.fullmatch(r"[a-z0-9_.-]+", args.index) or args.index == "_all":
         raise Error("Use one literal concrete index name, without aliases or wildcards.")
@@ -186,6 +194,9 @@ def run(client, args):
         raise Error("--target must be a simple root field name, e.g. forensic_all_dates.")
     if args.max_docs < 0 or not 1 <= args.batch_size <= 1000:
         raise Error("--max-docs must be >= 0; --batch-size must be between 1 and 1000.")
+    if args.refresh not in ("final", "batch", "none") or args.progress_every < 0:
+        raise Error("--refresh must be final, batch or none; --progress-every must be >= 0.")
+    started = last_progress = monotonic()
     path = "/" + quote(args.index, safe="")
     mappings = client.request("GET", path + "/_mapping")
     if list(mappings) != [args.index]:
@@ -200,7 +211,8 @@ def run(client, args):
                       "index": args.index, "target": args.target, "source_fields": fields,
                       "documents_without_indexed_target": count["count"],
                       "max_docs": args.max_docs or "all",
-                      "coverage": "explicit subset" if requested else "physical mapped dates"}, indent=2))
+                      "batch_size": args.batch_size, "refresh": args.refresh,
+                      "coverage": "explicit subset" if requested else "physical mapped dates"}, indent=2), flush=True)
     if nanos:
         print("NOTE: date_nanos values will be floored to milliseconds; originals are retained.")
     if mapping.get("runtime"):
@@ -212,6 +224,7 @@ def run(client, args):
     stats = {"scanned": 0, "prepared": 0, "updated": 0, "noops": 0, "skipped": 0, "failed": 0}
     pit_id = None
     shown = 0
+    bulk_attempted = completed = False
     try:
         opened = client.request("POST", path + "/_pit?keep_alive=2m")
         pit_id = opened["id"]
@@ -244,7 +257,9 @@ def run(client, args):
                 print("Example: " + json.dumps(preview))
                 shown += 1
             if args.apply and payload:
-                result = client.request("POST", path + "/_bulk?refresh=true", payload, ndjson=True)
+                bulk_attempted = True
+                refresh = "true" if args.refresh == "batch" else "false"
+                result = client.request("POST", path + "/_bulk?refresh=" + refresh, payload, ndjson=True)
                 items = result.get("items", [])
                 if len(items) != len(hits) - skipped:
                     raise Error("Unexpected bulk response length; some writes may have completed.")
@@ -260,17 +275,41 @@ def run(client, args):
                     raise Error("Bulk had failed items (possibly version conflicts). "
                                 "Successful updates remain; rerun to read fresh values.")
             after = hits[-1]["sort"]
+            now = monotonic()
+            if args.progress_every and now - last_progress >= args.progress_every:
+                print("Progress: " + json.dumps(progress(stats, started)), flush=True)
+                last_progress = now
+        completed = True
     finally:
         if pit_id:
             try:
                 client.request("DELETE", "/_pit", {"id": pit_id})
             except Error:
                 print("NOTE: PIT cleanup failed; its keep_alive will expire.", file=sys.stderr)
-        print("Summary: " + json.dumps(stats))
+        try:
+            if bulk_attempted and args.refresh == "final":
+                # Also expose successful writes after a partially failed bulk.
+                # Refresh after closing the PIT so its old segments can be released.
+                try:
+                    refreshed = client.request("POST", path + "/_refresh")
+                    if refreshed.get("_shards", {}).get("failed", 0):
+                        raise Error("Final refresh had shard failures; search visibility is not confirmed.")
+                except (Error, ValueError) as exc:
+                    if completed:
+                        raise Error("Final refresh failed; successful writes remain but search "
+                                    "visibility is not confirmed. " + str(exc)) from None
+                    # Preserve the original search/bulk/transport error.
+                    print("NOTE: Final refresh failed; successful writes remain but may not "
+                          "yet be searchable. " + str(exc), file=sys.stderr)
+        finally:
+            stats.update(progress(stats, started))
+            print("Summary: " + json.dumps(stats), flush=True)
     if not args.apply:
         print("Preview complete: no mappings or documents changed. Add --apply to populate the field.")
     else:
         print("Applied to the selected documents. This does not populate future imports or modify Kibana.")
+        if args.refresh == "none":
+            print("No refresh was requested; search visibility follows the index refresh policy.")
     return stats
 
 
@@ -281,7 +320,11 @@ def main():
     parser.add_argument("--target", default="forensic_all_dates")
     parser.add_argument("--fields", help="Optional comma-separated source date fields; otherwise discover all")
     parser.add_argument("--max-docs", type=int, default=1000, help="Maximum documents examined; 0 = all")
-    parser.add_argument("--batch-size", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=1000, help="Documents per page/bulk (1-1000; default: 1000)")
+    parser.add_argument("--refresh", choices=("final", "batch", "none"), default="final",
+                        help="Refresh once on exit (default), after each bulk, or never explicitly")
+    parser.add_argument("--progress-every", type=int, default=10,
+                        help="Report progress after a batch every N seconds; 0 disables (default: 10)")
     parser.add_argument("--ca-cert", default=os.environ.get("ES_CA_CERT"))
     parser.add_argument("--apply", action="store_true", help="Add mapping and update documents; default is preview")
     args = parser.parse_args()

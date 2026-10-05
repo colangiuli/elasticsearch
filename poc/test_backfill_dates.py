@@ -6,6 +6,7 @@ import copy
 import io
 import json
 import unittest
+from unittest.mock import patch
 
 import backfill_dates as poc
 
@@ -21,7 +22,7 @@ def hit(identifier, first, second, **extra):
 
 
 class FakeClient:
-    def __init__(self, pages=None, fail_bulk=False, fail_search=False):
+    def __init__(self, pages=None, fail_bulk=False, fail_search=False, fail_refresh=False):
         self.pages = pages if pages is not None else [
             [hit("a", ["1000"], ["2000", "1000"], _routing="host-1")],
             [hit("b", [], []), hit("c", ["3000"], [], _source={"forensic_all_dates": []})],
@@ -30,6 +31,7 @@ class FakeClient:
         self.search_count = 0
         self.fail_bulk = fail_bulk
         self.fail_search = fail_search
+        self.fail_refresh = fail_refresh
 
     def request(self, method, path, body=None, ndjson=False):
         self.calls.append((method, path, copy.deepcopy(body)))
@@ -56,12 +58,15 @@ class FakeClient:
             return {"errors": self.fail_bulk, "items": items}
         if method == "DELETE" and path == "/_pit":
             return {"succeeded": True}
+        if path.endswith("/_refresh"):
+            return {"_shards": {"failed": 1 if self.fail_refresh else 0}}
         raise AssertionError((method, path, body))
 
 
-def args(apply=False, limit=0):
+def args(apply=False, limit=0, refresh="final", progress_every=10):
     return argparse.Namespace(index="dev-mft", target="forensic_all_dates", fields=None,
-                              max_docs=limit, batch_size=200, apply=apply)
+                              max_docs=limit, batch_size=1000, apply=apply,
+                              refresh=refresh, progress_every=progress_every)
 
 
 class PocTests(unittest.TestCase):
@@ -75,7 +80,8 @@ class PocTests(unittest.TestCase):
         self.assertEqual(stats["scanned"], 3)
         self.assertEqual(stats["prepared"], 1)
         self.assertEqual(stats["skipped"], 2)
-        self.assertFalse(any(method == "PUT" or "/_bulk" in path for method, path, _ in client.calls))
+        self.assertFalse(any(method == "PUT" or "/_bulk" in path or path.endswith("/_refresh")
+                             for method, path, _ in client.calls))
         searches = [body for _, path, body in client.calls if path.startswith("/_search")]
         self.assertEqual(searches[1]["pit"]["id"], "pit-1")
         self.assertEqual(searches[1]["search_after"], ["a"])
@@ -108,7 +114,90 @@ class PocTests(unittest.TestCase):
         with self.assertRaisesRegex(poc.Error, "Successful updates remain"):
             self.run_quietly(client, args(apply=True))
         self.assertEqual(client.search_count, 1)
-        self.assertEqual(client.calls[-1], ("DELETE", "/_pit", {"id": "pit-1"}))
+        self.assertEqual(client.calls[-2], ("DELETE", "/_pit", {"id": "pit-1"}))
+        self.assertEqual(client.calls[-1], ("POST", "/dev-mft/_refresh", None))
+
+    def test_multiple_bulk_pages_refresh_only_once_after_pit_cleanup(self):
+        client = FakeClient(pages=[[hit("a", ["1"], [])], [hit("b", ["2"], [])], []])
+        stats = self.run_quietly(client, args(apply=True))
+        self.assertEqual(stats["updated"], 2)
+        self.assertEqual([path for _, path, _ in client.calls if "/_bulk" in path],
+                         ["/dev-mft/_bulk?refresh=false"] * 2)
+        self.assertEqual(sum(path.endswith("/_refresh") for _, path, _ in client.calls), 1)
+        self.assertEqual(client.calls[-2], ("DELETE", "/_pit", {"id": "pit-3"}))
+        self.assertEqual(client.calls[-1], ("POST", "/dev-mft/_refresh", None))
+
+    def test_optional_batch_and_none_refresh_policies(self):
+        for policy, expected in [("batch", "true"), ("none", "false")]:
+            with self.subTest(policy=policy):
+                client = FakeClient()
+                self.run_quietly(client, args(apply=True, refresh=policy))
+                self.assertIn(("POST", "/dev-mft/_bulk?refresh=" + expected),
+                              [(method, path) for method, path, _ in client.calls])
+                self.assertFalse(any(path.endswith("/_refresh") for _, path, _ in client.calls))
+
+    def test_apply_without_updates_does_not_refresh(self):
+        client = FakeClient(pages=[[hit("a", [], [])], []])
+        self.run_quietly(client, args(apply=True))
+        self.assertFalse(any(path.endswith("/_refresh") for _, path, _ in client.calls))
+
+    def test_final_refresh_failure_is_reported_with_summary(self):
+        client = FakeClient(fail_refresh=True)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), self.assertRaisesRegex(poc.Error, "Final refresh"):
+            poc.run(client, args(apply=True))
+        summary = json.loads(next(line.split(": ", 1)[1]
+                                  for line in output.getvalue().splitlines() if line.startswith("Summary: ")))
+        self.assertEqual(summary["updated"], 1)
+        self.assertNotIn("Applied to the selected documents", output.getvalue())
+
+    def test_refresh_failure_preserves_original_bulk_error(self):
+        client = FakeClient(fail_bulk=True, fail_refresh=True)
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), self.assertRaisesRegex(poc.Error, "Bulk had failed items"):
+            self.run_quietly(client, args(apply=True))
+        self.assertIn("Final refresh failed", output.getvalue())
+
+    def test_transport_failure_still_attempts_final_refresh(self):
+        client = FakeClient()
+        request = client.request
+
+        def fail_bulk_transport(method, path, body=None, ndjson=False):
+            if "/_bulk" in path:
+                raise poc.Error("Transport failure; a write may have partially completed.")
+            return request(method, path, body, ndjson)
+
+        client.request = fail_bulk_transport
+        with self.assertRaisesRegex(poc.Error, "Transport failure"):
+            self.run_quietly(client, args(apply=True))
+        self.assertEqual(client.calls[-1], ("POST", "/dev-mft/_refresh", None))
+
+    def test_malformed_refresh_response_preserves_original_bulk_error(self):
+        client = FakeClient(fail_bulk=True)
+        request = client.request
+
+        def malformed_refresh(method, path, body=None, ndjson=False):
+            if path.endswith("/_refresh"):
+                raise ValueError("Invalid JSON response")
+            return request(method, path, body, ndjson)
+
+        client.request = malformed_refresh
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), self.assertRaisesRegex(poc.Error, "Bulk had failed items"):
+            self.run_quietly(client, args(apply=True))
+        self.assertIn("Final refresh failed", output.getvalue())
+
+    def test_progress_and_summary_measure_confirmed_updates(self):
+        client = FakeClient(pages=[[hit("a", ["1"], [])]])
+        output = io.StringIO()
+        with patch.object(poc, "monotonic", side_effect=[0, 11, 11, 12]), contextlib.redirect_stdout(output):
+            stats = poc.run(client, args(apply=True, limit=1))
+        report = json.loads(next(line.split(": ", 1)[1]
+                                 for line in output.getvalue().splitlines() if line.startswith("Progress: ")))
+        self.assertEqual(report["updated"], 1)
+        self.assertEqual(report["elapsed_seconds"], 11)
+        self.assertEqual(stats["elapsed_seconds"], 12)
+        self.assertEqual(stats["updated_per_second"], 0.1)
 
     def test_search_timeout_never_sends_bulk(self):
         client = FakeClient(fail_search=True)
