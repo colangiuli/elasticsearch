@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import copy
+from datetime import datetime, timedelta, timezone
 import io
 import json
 import unittest
@@ -11,13 +12,19 @@ from unittest.mock import patch
 import backfill_dates as poc
 
 
-MAPPING = {"properties": {"@timestamp": {"type": "date"},
-                           "modified": {"type": "date", "format": "epoch_second"}}}
+MAPPING = {"properties": {"@timestamp": {"type": "date"}, "modified": {"type": "date"}}}
+
+
+def iso(millis):
+    return (datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=int(millis))).isoformat()
 
 
 def hit(identifier, first, second, **extra):
+    source = extra["_source"] if "_source" in extra else {
+        "@timestamp": [iso(value) for value in first], "modified": [iso(value) for value in second]}
     return {"_index": "dev-mft", "_id": identifier, "_seq_no": 7,
-            "_primary_term": 2, "sort": [identifier], "_source": {},
+            "_primary_term": 2, "sort": [identifier],
+            "_source": source,
             "fields": {"@timestamp": first, "modified": second}, **extra}
 
 
@@ -37,6 +44,8 @@ class FakeClient:
         self.calls.append((method, path, copy.deepcopy(body)))
         if path.endswith("/_mapping"):
             return {"dev-mft": {"mappings": copy.deepcopy(MAPPING)}} if method == "GET" else {"acknowledged": True}
+        if "/_settings?" in path:
+            return {"dev-mft": {"settings": {"index.mapping.source.mode": "stored"}}}
         if path.endswith("/_count"):
             return {"count": 3, "_shards": {"failed": 0}}
         if "/_pit?" in path:
@@ -93,14 +102,157 @@ class PocTests(unittest.TestCase):
         self.assertEqual(stats["updated"], 1)
         bulk = next(body for _, path, body in client.calls if "/_bulk" in path)
         action, body = [json.loads(line) for line in bulk.splitlines()]
-        self.assertEqual(body, {"doc": {"forensic_all_dates": [1000, 2000]}})
+        self.assertEqual(body, {"doc": {"forensic_all_dates": [iso(1000), iso(2000)]}})
         self.assertEqual(action["update"]["routing"], "host-1")
         self.assertEqual(action["update"]["if_seq_no"], 7)
         self.assertEqual(action["update"]["if_primary_term"], 2)
         search = next(body for _, path, body in client.calls if path.startswith("/_search"))
         self.assertTrue(search["seq_no_primary_term"])
         self.assertEqual(search["stored_fields"], ["_routing"])
+        self.assertEqual(search["_source"], ["@timestamp", "forensic_all_dates", "modified"])
         self.assertEqual(search["docvalue_fields"][1], {"field": "modified", "format": "epoch_millis"})
+
+    def test_exact_source_strings_survive_precision_offsets_and_deduplication(self):
+        original = "2026-03-24T01:09:47.8609249+00:00"
+        equivalent = "2026-03-24T02:09:47.8609249+01:00"
+        distinct_fraction = "2026-03-24T01:09:47.8609250Z"
+        client = FakeClient(pages=[[hit("a", ["1774314587860"], ["1774314587860"],
+            _source={"@timestamp": original,
+                     "modified": [original, equivalent, distinct_fraction, None]})], []])
+        self.run_quietly(client, args(apply=True))
+        payload = next(body for _, path, body in client.calls if "/_bulk" in path)
+        self.assertEqual(json.loads(payload.splitlines()[1]), {"doc": {
+            "forensic_all_dates": [original, equivalent, distinct_fraction]}})
+
+    def test_acquisition_time_is_excluded_without_removing_equal_evidence_dates(self):
+        for acquisition_millis in [1000, 2000]:
+            acquisition = iso(acquisition_millis)
+            client = FakeClient(pages=[[hit("a", ["1000"], [],
+                _source={"@timestamp": iso(1000), "acquisition_time": acquisition},
+                fields={"@timestamp": ["1000"], "acquisition_time": [str(acquisition_millis)],
+                        "acquisition_time.as_date": [str(acquisition_millis)]})], []])
+            with self.subTest(acquisition=acquisition), patch.dict(MAPPING["properties"], {
+                "acquisition_time": {"type": "date", "fields": {"as_date": {"type": "date"}}}
+            }):
+                self.run_quietly(client, args(apply=True))
+            payload = next(body for _, path, body in client.calls if "/_bulk" in path)
+            self.assertEqual(json.loads(payload.splitlines()[1]),
+                             {"doc": {"forensic_all_dates": [iso(1000)]}})
+            search = next(body for _, path, body in client.calls if path.startswith("/_search"))
+            self.assertNotIn("acquisition_time", search["_source"])
+            self.assertEqual([field["field"] for field in search["docvalue_fields"]],
+                             ["@timestamp", "modified"])
+
+    def test_explicit_fields_cannot_include_acquisition_time_or_its_multifields(self):
+        mapping = copy.deepcopy(MAPPING)
+        mapping["properties"]["acquisition_time"] = {
+            "type": "keyword", "fields": {"as_date": {"type": "date"}}}
+        for excluded in ["acquisition_time", "acquisition_time.as_date"]:
+            with self.subTest(excluded=excluded), self.assertRaisesRegex(poc.Error, "excluded"):
+                poc.select_fields(mapping, "forensic_all_dates", ["@timestamp", excluded])
+        fields, _ = poc.select_fields(mapping, "forensic_all_dates", None)
+        self.assertEqual(fields, ["@timestamp", "modified"])
+
+    def test_only_acquisition_time_leaves_no_eligible_dates(self):
+        with self.assertRaisesRegex(poc.Error, "No eligible"):
+            poc.select_fields({"properties": {"acquisition_time": {"type": "date"}}},
+                              "forensic_all_dates", None)
+
+    def test_object_paths_dotted_keys_and_multifields_use_original_source(self):
+        mapping = {"properties": {
+            "mft": {"properties": {"fn_atime": {"type": "date"}}},
+            "text_date": {"type": "keyword", "fields": {"as_date": {"type": "date"}}},
+            "rows": {"properties": {"meta": {"properties": {"when": {"type": "date"}}}}}}}
+        client = FakeClient(pages=[[hit("a", [], [],
+            _source={"mft": {"fn_atime": iso(1)}, "mft.fn_atime": iso(2),
+                     "text_date": iso(3), "rows": [{"meta.when": [iso(4), None]},
+                                                    {"meta": {"when": iso(5)}}],
+                     "rows.meta": {"when": iso(6)}, "rows.meta.when": iso(7)},
+            fields={"mft.fn_atime": ["1", "2"], "text_date.as_date": ["3"],
+                    "rows.meta.when": ["4", "5", "6", "7"]})], []])
+        with patch.dict(MAPPING, mapping, clear=True):
+            self.run_quietly(client, args(apply=True))
+        payload = next(body for _, path, body in client.calls if "/_bulk" in path)
+        self.assertEqual(json.loads(payload.splitlines()[1])["doc"]["forensic_all_dates"],
+                         [iso(n) for n in [1, 2, 4, 5, 6, 7, 3]])
+        search = next(body for _, path, body in client.calls if path.startswith("/_search"))
+        self.assertIn("text_date", search["_source"])
+        self.assertNotIn("text_date.as_date", search["_source"])
+
+    def test_unsupported_or_inconsistent_source_stops_page_before_bulk(self):
+        for source in [{"@timestamp": 1}, {"@timestamp": "1"},
+                       {"@timestamp": "01/01/1970"}, {"@timestamp": True},
+                       {"@timestamp": "2026-02-30T00:00:00Z"},
+                       {"@timestamp": {"unexpected": iso(1000)}},
+                       {"@timestamp": None}, {}, None,
+                       {"@timestamp": [iso(1000), "malformed"]},
+                       {"@timestamp": iso(2000)}]:
+            with self.subTest(source=source):
+                client = FakeClient(pages=[[hit("good", ["1000"], []),
+                                           hit("bad", ["1000"], [], _source=source)]])
+                with self.assertRaises(poc.Error):
+                    self.run_quietly(client, args(apply=True))
+                self.assertFalse(any("/_bulk" in path for _, path, _ in client.calls))
+                self.assertEqual(client.calls[-1][0], "DELETE")
+
+    def test_each_field_must_match_indexed_dates_independently(self):
+        client = FakeClient(pages=[[hit("a", ["1000"], ["2000"],
+            _source={"@timestamp": iso(2000), "modified": iso(1000)})]])
+        with self.assertRaisesRegex(poc.Error, "do not match indexed"):
+            self.run_quietly(client, args(apply=True))
+        self.assertFalse(any("/_bulk" in path for _, path, _ in client.calls))
+
+    def test_unindexed_source_values_are_not_copied(self):
+        client = FakeClient(pages=[[hit("a", ["1000"], [],
+            _source={"@timestamp": iso(1000), "modified": "ignored malformed value"})], []])
+        self.run_quietly(client, args(apply=True))
+        payload = next(body for _, path, body in client.calls if "/_bulk" in path)
+        self.assertEqual(json.loads(payload.splitlines()[1]),
+                         {"doc": {"forensic_all_dates": [iso(1000)]}})
+
+    def test_existing_numeric_target_is_not_rewritten(self):
+        client = FakeClient(pages=[[hit("a", ["1000"], [],
+            _source={"@timestamp": iso(1000), "forensic_all_dates": [1000]})], []])
+        stats = self.run_quietly(client, args(apply=True))
+        self.assertEqual(stats["skipped"], 1)
+        self.assertFalse(any("/_bulk" in path for _, path, _ in client.calls))
+
+    def test_source_comparison_preserves_pre_epoch_and_submillisecond_instants(self):
+        for original, expected in [
+            ("2026-03-24T01:09:47.8609249+00:00", 1774314587860),
+            ("2026-03-24T02:09:47.8609249+01:00", 1774314587860),
+            ("1969-12-31T23:59:59.999999999Z", -1),
+            ("1970-01-01", 0), ("1970-01-01T00:00:00", 0),
+        ]:
+            with self.subTest(original=original):
+                self.assertEqual(poc.source_epoch_millis(original, "date"), expected)
+        for invalid in ["1970-01-01T00:00:00+00:60", "1970-01-01T00:00:00+19:00"]:
+            with self.subTest(invalid=invalid), self.assertRaises(poc.Error):
+                poc.source_epoch_millis(invalid, "date")
+
+    def test_synthetic_source_is_rejected_before_writes(self):
+        for origin in ["settings", "defaults"]:
+            client = FakeClient()
+            request = client.request
+
+            def synthetic_settings(method, path, body=None, ndjson=False):
+                if "/_settings?" in path:
+                    return {"dev-mft": {origin: {"index.mapping.source.mode": "synthetic"}}}
+                return request(method, path, body, ndjson)
+
+            client.request = synthetic_settings
+            with self.subTest(origin=origin), self.assertRaisesRegex(poc.Error, "Synthetic"):
+                self.run_quietly(client, args(apply=True))
+            self.assertFalse(any(method == "PUT" or "/_bulk" in path for method, path, _ in client.calls))
+
+    def test_nanos_source_string_is_preserved_in_millisecond_target(self):
+        client = FakeClient(pages=[[hit("a", ["1000.999999"], [],
+            _source={"@timestamp": "1970-01-01T00:00:01.000999999Z"})], []])
+        with patch.dict(MAPPING["properties"]["@timestamp"], {"type": "date_nanos"}):
+            self.run_quietly(client, args(apply=True))
+        payload = next(body for _, path, body in client.calls if "/_bulk" in path)
+        self.assertEqual(json.loads(payload.splitlines()[1]), {"doc": {
+            "forensic_all_dates": ["1970-01-01T00:00:01.000999999Z"]}})
 
     def test_small_limit_is_applied_to_the_search(self):
         client = FakeClient(pages=[[hit("a", ["1000"], [])]])
@@ -224,6 +376,7 @@ class PocTests(unittest.TestCase):
 
     def test_target_compatibility_and_runtime_shadowing(self):
         for spec in [{"type": "keyword"}, {"type": "date", "format": "yyyy-MM-dd"},
+                     {"type": "date", "format": "epoch_second||strict_date_optional_time"},
                      {"type": "date", "doc_values": False}, {"type": "date", "index": False}]:
             mapping = copy.deepcopy(MAPPING)
             mapping["properties"]["forensic_all_dates"] = spec

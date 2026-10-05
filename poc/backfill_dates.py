@@ -2,11 +2,13 @@
 """Populate one ES8 development index with an indexed array of existing dates.
 
 Python 3 standard library only. Preview is the default; --apply writes.
-Reads formatted doc values, not raw date strings. Does not modify templates.
+Copies original ISO date strings from _source, checked against doc values.
+Does not modify templates or overwrite an existing target field.
 """
 
 import argparse
 import base64
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 import json
 import os
@@ -17,6 +19,9 @@ from time import monotonic
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
+
+
+EXCLUDED_SOURCE_FIELDS = {"acquisition_time"}
 
 
 class Error(Exception):
@@ -66,8 +71,8 @@ class Client:
                         "a write may have partially completed. No automatic retry was made.") from None
 
 
-def discover(properties, prefix="", nested=False):
-    """Return physical date fields and why a field cannot be read by this POC."""
+def discover(properties, prefix="", nested=False, source_field=None):
+    """Return date mappings, unsupported reasons and their actual _source paths."""
     found = {}
     for name, spec in properties.items():
         path = prefix + name
@@ -78,15 +83,18 @@ def discover(properties, prefix="", nested=False):
             reason = "nested date" if inside_nested else (
                 "doc_values disabled" if spec.get("doc_values") is False else None
             )
-            found[path] = (spec, reason)
-        found.update(discover(spec.get("properties", {}), path + ".", inside_nested))
-        found.update(discover(spec.get("fields", {}), path + ".", inside_nested))
+            found[path] = (spec, reason, source_field or path)
+        found.update(discover(spec.get("properties", {}), path + ".", inside_nested, source_field))
+        # Multifields index their parent's value; they have no separate _source key.
+        found.update(discover(spec.get("fields", {}), path + ".", inside_nested, source_field or path))
     return found
 
 
 def select_fields(mapping, target, requested):
     if mapping.get("_source", {}).get("enabled") is False:
         raise Error("Updating documents requires _source to be enabled.")
+    if mapping.get("_source", {}).get("mode") == "synthetic":
+        raise Error("Synthetic _source cannot guarantee original date strings.")
     if mapping.get("_source", {}).get("includes") or mapping.get("_source", {}).get("excludes"):
         raise Error("This POC does not update indices with pruned _source mappings.")
     if mapping.get("enabled") is False:
@@ -99,8 +107,8 @@ def select_fields(mapping, target, requested):
             target_mapping.get("type") == "date"
             and target_mapping.get("index", True)
             and target_mapping.get("doc_values", True)
-            and "epoch_millis" in target_mapping.get(
-                "format", "strict_date_optional_time||epoch_millis").split("||")
+            and target_mapping.get("format", "strict_date_optional_time||epoch_millis").split("||")[0]
+                == "strict_date_optional_time"
             and not target_mapping.get("script")
             and not target_mapping.get("copy_to")
             and not target_mapping.get("ignore_malformed", False)
@@ -109,9 +117,17 @@ def select_fields(mapping, target, requested):
             raise Error("Existing target mapping is incompatible; choose another --target.")
     all_fields = discover(mapping.get("properties", {}))
     all_fields.pop(target, None)
-    names = sorted(set(requested or all_fields))
+    # Exclude the source field and any multifields indexing that same value.
+    excluded = EXCLUDED_SOURCE_FIELDS | {
+        name for name, (_, _, source_path) in all_fields.items()
+        if source_path in EXCLUDED_SOURCE_FIELDS
+    }
+    if requested and excluded.intersection(requested):
+        raise Error("These source fields are excluded from forensic dates: " +
+                    ", ".join(sorted(excluded.intersection(requested))))
+    names = sorted(set(requested) if requested else set(all_fields) - excluded)
     if not names:
-        raise Error("No mapped source date fields were found.")
+        raise Error("No eligible mapped source date fields were found (acquisition_time is excluded).")
     unsupported = []
     for name in names:
         if name in mapping.get("runtime", {}):
@@ -148,16 +164,73 @@ def check_search(response):
         raise Error("Search timed out or had shard failures; refusing partial input.")
 
 
-def make_updates(hits, fields, target, routing_required):
+def source_values(value, path):
+    """Read object paths, literal dotted keys and arrays without altering scalars."""
+    if isinstance(value, list):
+        for item in value:
+            yield from source_values(item, path)
+    elif not path:
+        if value is not None:
+            yield value
+    elif isinstance(value, dict):
+        # Both {"mft": {"fn_atime": ...}} and {"mft.fn_atime": ...} are valid.
+        parts = path.split(".")
+        for end in range(1, len(parts) + 1):
+            key = ".".join(parts[:end])
+            if key in value:
+                yield from source_values(value[key], ".".join(parts[end:]))
+
+
+ISO_DATE = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}"
+    r"(?:T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?"
+    r"(?:Z|[+-](?:0[0-9]|1[0-7]):[0-5][0-9]|[+-]18:00)?)?"
+)
+
+
+def source_epoch_millis(value, field):
+    """Parse only for comparison; callers retain the exact original string."""
+    if not isinstance(value, str) or not ISO_DATE.fullmatch(value):
+        raise Error(f"Field {field} has a non-ISO _source date; exact copying requires ISO strings. "
+                    "Use --fields only for an explicitly supported subset.")
+    # datetime uses microseconds; discard finer digits for this comparison only.
+    comparable = re.sub(r"\.([0-9]+)", lambda m: "." + m[1][:6].ljust(6, "0"), value)
+    try:
+        parsed = datetime.fromisoformat(comparable.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        delta = parsed.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    except (ValueError, OverflowError):
+        raise Error(f"Field {field} has an unsupported ISO _source date.") from None
+    return delta.days * 86400000 + delta.seconds * 1000 + delta.microseconds // 1000
+
+
+def make_updates(hits, fields, target, routing_required, source_paths=None):
     lines, previews = [], []
     skipped = 0
     for hit in hits:
+        source = hit.get("_source")
+        if not isinstance(source, dict):
+            raise Error("Missing _source; original date strings cannot be copied.")
         # An unindexed or empty target in _source is still existing user data.
-        if target in hit.get("_source", {}):
+        if target in source:
             skipped += 1
             continue
-        values = sorted({epoch_millis(value) for field in fields
-                         for value in hit.get("fields", {}).get(field, [])})
+        values = []
+        seen = set()
+        for field in fields:
+            indexed = {epoch_millis(value) for value in hit.get("fields", {}).get(field, [])}
+            if not indexed:
+                continue
+            originals = list(source_values(source, (source_paths or {}).get(field, field)))
+            represented = {source_epoch_millis(value, field) for value in originals}
+            if represented != indexed:
+                raise Error(f"Field {field}: _source dates do not match indexed dates. "
+                            "Cannot preserve original values with complete coverage; no updates sent for this page.")
+            for value in originals:
+                if value not in seen:
+                    seen.add(value)
+                    values.append(value)
         if not values:
             skipped += 1
             continue
@@ -204,17 +277,27 @@ def run(client, args):
     mapping = mappings[args.index]["mappings"]
     requested = [s.strip() for s in args.fields.split(",") if s.strip()] if args.fields else None
     fields, nanos = select_fields(mapping, args.target, requested)
+    settings = client.request("GET", path + "/_settings?flat_settings=true&include_defaults=true")[args.index]
+    source_mode = settings.get("settings", {}).get("index.mapping.source.mode",
+                   settings.get("defaults", {}).get("index.mapping.source.mode", "stored"))
+    if source_mode == "synthetic":
+        raise Error("Synthetic _source cannot guarantee original date strings.")
+    catalog = discover(mapping.get("properties", {}))
+    source_paths = {field: catalog[field][2] for field in fields}
     query = {"bool": {"must_not": [{"exists": {"field": args.target}}]}}
     count = client.request("POST", path + "/_count", {"query": query})
     check_search(count)
     print(json.dumps({"mode": "APPLY" if args.apply else "PREVIEW",
                       "index": args.index, "target": args.target, "source_fields": fields,
+                      "excluded_source_fields": sorted(EXCLUDED_SOURCE_FIELDS),
                       "documents_without_indexed_target": count["count"],
                       "max_docs": args.max_docs or "all",
                       "batch_size": args.batch_size, "refresh": args.refresh,
-                      "coverage": "explicit subset" if requested else "physical mapped dates"}, indent=2), flush=True)
+                      "representation": "original ISO strings from _source",
+                      "coverage": "explicit subset" if requested else
+                                  "physical mapped dates excluding acquisition_time"}, indent=2), flush=True)
     if nanos:
-        print("NOTE: date_nanos values will be floored to milliseconds; originals are retained.")
+        print("NOTE: original date_nanos strings are preserved; the target date field indexes milliseconds.")
     if mapping.get("runtime"):
         print("NOTE: runtime fields are not copied; this POC reads physical date fields only.")
     if args.apply and args.target not in mapping.get("properties", {}):
@@ -235,7 +318,7 @@ def run(client, args):
                 args.batch_size, args.max_docs - stats["scanned"])
             body = {"size": size, "query": query, "pit": {"id": pit_id, "keep_alive": "2m"},
                     "sort": ["_shard_doc"], "track_total_hits": False,
-                    "seq_no_primary_term": True, "_source": [args.target],
+                    "seq_no_primary_term": True, "_source": sorted({args.target, *source_paths.values()}),
                     "stored_fields": ["_routing"],
                     "docvalue_fields": [{"field": field, "format": "epoch_millis"} for field in fields]}
             if after is not None:
@@ -249,7 +332,7 @@ def run(client, args):
             if any(hit["_index"] != args.index for hit in hits):
                 raise Error("Search returned an unexpected index; refusing to update it.")
             payload, previews, skipped = make_updates(
-                hits, fields, args.target, mapping.get("_routing", {}).get("required", False))
+                hits, fields, args.target, mapping.get("_routing", {}).get("required", False), source_paths)
             stats["scanned"] += len(hits)
             stats["skipped"] += skipped
             stats["prepared"] += len(hits) - skipped
@@ -318,7 +401,7 @@ def main():
     parser.add_argument("--url", default=os.environ.get("ES_URL", "http://localhost:9200"))
     parser.add_argument("--index", required=True, help="One concrete development index, not the case alias")
     parser.add_argument("--target", default="forensic_all_dates")
-    parser.add_argument("--fields", help="Optional comma-separated source date fields; otherwise discover all")
+    parser.add_argument("--fields", help="Optional comma-separated source date fields; acquisition_time is always excluded")
     parser.add_argument("--max-docs", type=int, default=1000, help="Maximum documents examined; 0 = all")
     parser.add_argument("--batch-size", type=int, default=1000, help="Documents per page/bulk (1-1000; default: 1000)")
     parser.add_argument("--refresh", choices=("final", "batch", "none"), default="final",

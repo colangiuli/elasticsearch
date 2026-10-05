@@ -1,10 +1,10 @@
-# Read-only comparison based on IMG_2727.jpg supplied on 2 October 2026.
+# Read-only example comparing canonical and array-based date filters.
 # Replace POC_INDEX with the concrete development index populated by the script.
-# Numerical bounds below preserve the observed query's inclusive upper endpoint.
+# Numerical bounds below use an inclusive upper endpoint.
 # No request has been executed against your cluster.
 # Keys "0" and "dh" are preserved for the existing response consumer.
 
-# 1. Observed array histogram request: selection still uses @timestamp.
+# 1. Example array histogram request: selection still uses @timestamp.
 GET /POC_INDEX/_search?allow_partial_search_results=false
 {
   "size": 0,
@@ -46,7 +46,7 @@ GET /POC_INDEX/_search?allow_partial_search_results=false
 }
 
 # 2. Proposed first comparison: select AND aggregate on the date array.
-# In the observed query, the second window is wholly contained in the first.
+# In this example, the second window is wholly contained in the first.
 # The single range below therefore uses their intersection.
 # Treat this as a proposed replacement for AUTOMATIC temporal filters.
 # Intentionally entered analyst constraints on @timestamp are separate criteria.
@@ -85,9 +85,9 @@ GET /POC_INDEX/_search?allow_partial_search_results=false
   }
 }
 
-# 3. Show records omitted by the observed canonical filter but matching the array.
+# 3. Show records omitted by the canonical filter but matching the array.
 # This also includes records with no indexed @timestamp; inspect source values.
-# A zero count is possible for this very broad observed window. Repeat with a
+# A zero count is possible for this very broad example window. Repeat with a
 # narrower window around a secondary MFT timestamp, changing BOTH ranges together.
 GET /POC_INDEX/_search?allow_partial_search_results=false
 {
@@ -123,4 +123,4 @@ GET /POC_INDEX/_search?allow_partial_search_results=false
 # This comparison does not yet crop out-of-window array values from the chart.
 # For histogram bounds and exact partial bucket counts, see verify-array.http.
 # The table's own request must also use the selected temporal mode; size:0 here
-# means the original requests contain no table records to inspect.
+# means the example histogram requests contain no table records to inspect.
