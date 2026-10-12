@@ -104,7 +104,7 @@ Primary references: [formatted doc values](https://www.elastic.co/guide/en/elast
 
 ## Discover date fields for artifact configuration files
 
-`discover_artifact_dates.py` builds the `forensic_all_dates` field catalog in local artifact YAML files. It reads Elasticsearch mappings and, where necessary, original document values. It makes no document, mapping or index-setting changes. Its `--apply` option writes only local YAML files, without backups or automatic Git operations.
+`discover_artifact_dates.py` builds the `forensic_all_dates` field catalog in local artifact YAML files. It reads Elasticsearch mappings and, where necessary, original document values from one nonempty representative index per artifact. It makes no document, mapping or index-setting changes. It saves local discovery checkpoints; `--apply` additionally writes eligible local YAML files, without backups or automatic Git operations.
 
 ### Install and run
 
@@ -125,16 +125,16 @@ export ARTIFACTS_DIR='/path/to/collections_processor/src/processor/conf/velocira
 
 Authentication follows the backfill script: set `ES_API_KEY` to an encoded Elasticsearch API key, or set both `ES_USERNAME` and `ES_PASSWORD`. For a private certificate authority, set `ES_CA_CERT` to its PEM file path. Supply credentials through your normal environment or secret mechanism. The account needs permission to resolve indices, read mappings/settings, search documents, and open/close point-in-time search contexts.
 
-Preview the proposed YAML differences without writing files:
+Preview the proposed YAML differences without writing YAML files (a discovery checkpoint is saved):
 
 ```bash
 python poc/discover_artifact_dates.py
 ```
 
-Apply the changes, or optionally limit the indices and override `ARTIFACTS_DIR`:
+Apply the completed preview using its saved discovery, or start a new scan with optional index and directory overrides:
 
 ```bash
-python poc/discover_artifact_dates.py --apply
+python poc/discover_artifact_dates.py --resume --apply
 
 python poc/discover_artifact_dates.py \
   --index-pattern 'ir_data_*_velociraptor_*' \
@@ -142,27 +142,53 @@ python poc/discover_artifact_dates.py \
   --apply
 ```
 
-`--artifacts-dir` takes precedence over `ARTIFACTS_DIR`. One must be supplied, and the directory must already exist. The default `--index-pattern '*'` examines concrete open indices, including hidden non-system indices, once each; closed and system indices are reported as excluded. Aliases do not cause duplicate processing. Narrowing the pattern also narrows the evidence available for deciding that a field contains only times.
+`--artifacts-dir` takes precedence over `ARTIFACTS_DIR`. One must be supplied, and the directory must already exist. The default `--index-pattern '*'` enumerates concrete open indices, including hidden non-system indices; closed, system and unrecognized index names are reported as excluded. Aliases do not cause duplicate processing. Narrowing the pattern changes which representative indices are available.
+
+### Checkpoints and resume
+
+Each completed artifact is saved in an atomic checkpoint, including artifacts with no valid dates and groups whose indices are all empty. If execution stops, resume with the same endpoint, pattern and artifact directory:
+
+```bash
+python poc/discover_artifact_dates.py --resume
+```
+
+Completed artifacts are restored without Elasticsearch requests. The interrupted artifact restarts from its first candidate index and uses a new PIT; document pages are not resumed. The checkpoint retains the original index inventory, so newly created indices are considered only by a new scan. A run without `--resume` starts a new discovery and replaces the checkpoint. Runs made with an older script version without checkpoints cannot be recovered.
+
+The checkpoint path is selected by `--state-file`, then `ARTIFACT_DATES_STATE`, then `.discover-artifact-dates.state.json` in the current working directory. The default filename is ignored by Git. To keep a checkpoint at a fixed location:
+
+```bash
+export ARTIFACT_DATES_STATE='/path/to/discovery-state.json'
+python poc/discover_artifact_dates.py
+python poc/discover_artifact_dates.py --resume --apply
+```
+
+`--resume` rejects a missing, corrupt or incompatible checkpoint. Compatibility includes the checkpoint/analysis version, Elasticsearch endpoint, index pattern and artifact directory. Checkpoints store inventory, completed evidence and counters, without credentials, raw document values, PIT IDs or search cursors. Keep a completed checkpoint to apply a preview later: `--resume --apply` rereads the current YAML files and recomputes differences from the saved discovery. It also lets an interrupted application finish without rescanning completed artifacts. Start a new scan when fresh Elasticsearch evidence is required.
 
 ### Discovery and date versus time handling
 
-Each index is assumed to contain one artifact source and one case. The script reads `artifact_source` from the original `_source` of one document and merges discoveries for the same artifact across indices and cases. For example, `artifact_source: mft` selects exactly `mft.yaml`; the artifact is never inferred from the index name. Empty indices and missing artifact sources are reported as skipped. Invalid names or paths escaping the configured directory are rejected.
+Each index is assumed to contain one artifact source and one case, and the same artifact is assumed to have the same structure across cases. Recognized names have the form `ir_data_<UUID with underscores>_velociraptor_<artifact>`, optionally followed by a numeric generation suffix such as `-000001`. For example, both `ir_data_f2a247c3_e812_4187_a7e3_d5649afdf0a4_velociraptor_mft-000001` and the same name without `-000001` belong to the `mft` group. Underscores inside the complete artifact name are preserved.
+
+For each group, indices are tried alphabetically until the first nonempty one. The script reads `_source.artifact_source` from one document before fetching its mapping and requires it to match the artifact parsed from the name; a mismatch stops discovery. For example, `artifact_source: mft` selects exactly `mft.yaml`. Only this representative index supplies mapping and value evidence; remaining duplicate indices receive no requests. A representative with no dates or unresolved evidence is still complete and does not trigger another index scan. All-empty groups are reported. Invalid artifact names or paths escaping the configured directory are rejected.
 
 The catalog includes physical `date` and `date_nanos` fields inside objects and `nested` structures. A date multifield contributes its parent path in `_source`, not the multifield name. Runtime fields, aliases, scripted date fields and the four root source paths `acquisition_time`, `collection_time`, `@timestamp` and `forensic_all_dates` are excluded. The same exclusions apply to multifields sourced from those paths. This discovery script does not impose the backfill script's doc-values or 100-field restrictions.
 
-Mapping formats distinguish dates, epochs and time-only values. Mixed or unclassified formats require inspecting original `_source` values; doc values are not used to infer dates because Elasticsearch can attach a date to a time-only input. The script scans with PIT and `search_after`, including later pages, until every unresolved candidate has a confirmed date or the index is exhausted. One confirmed date in any relevant index makes the field eligible. A field is established as time-only only with time evidence and no date or unclassifiable evidence across the relevant indices. Null, empty and missing values prove neither case. Unsupported format syntax is reported rather than guessed. Mixed date/time observations are reported; filtering individual values remains the processor's responsibility.
+Mapping formats distinguish dates, epochs and time-only values. Mixed or unclassified formats require inspecting original `_source` values; doc values are not used to infer dates because Elasticsearch can attach a date to a time-only input. The script scans the representative with PIT and `search_after`, including later pages, until every unresolved candidate has a confirmed date or the index is exhausted. One confirmed date makes a field eligible. A field requiring value verification is established as time-only only after a complete scan with time evidence and no date or unclassifiable evidence. Null, empty and missing values prove neither case. Unsupported format syntax is reported rather than guessed. Mixed date/time observations are reported; filtering individual values remains the processor's responsibility.
 
 Source values can come from nested objects, arrays or literal keys containing dots. Disabled, synthetic or pruned `_source` cannot provide reliable original-value evidence where that evidence is needed; these cases are reported as unresolved. Discovery based on unambiguous mapping formats does not need to scan every document. No date-like string outside a `date` or `date_nanos` mapping is added.
 
 Value recognition supports common numeric calendar patterns (for example `yyyy-MM-dd`, `dd/MM/yyyy`, `yyyyMMdd`), ISO dates, ordinal/week built-in formats, numeric times, fractions, offsets, quoted literals and optional sections. It is deliberately not a complete Java `DateTimeFormatter` implementation: locale names, named zones and advanced custom tokens remain unresolved. Calendar validation covers years 1–9999; valid Elasticsearch representations outside the supported subset can also remain unresolved. Format alternatives are tried in their declared order, so a numeric clock string is not automatically treated as an epoch. The evidence report includes the mapping format and any unsupported alternatives.
 
-Scanning uses `--batch-size 1000` and reports progress at `--progress-every 10` seconds by default. Change these options to adjust request size or reporting; `--progress-every 0` suppresses periodic progress. Requests are sequential and an individual slow request may delay a progress message. PIT contexts are closed on completion and on failure. Source verification may need to read every document when a candidate never yields a confirmed date, so there is no sampling limit that could mistake an early time-only page for complete evidence.
+Progress reports completed/total artifact groups and their percentage, the current artifact/index, groups recovered from the checkpoint, duplicate indices skipped, empty indices and artifacts without valid dates. The percentage measures artifact groups, not elapsed time or document coverage. A terminal uses an updating progress line; redirected output uses readable log messages. Completion updates are always emitted, including for resumed, empty and skipped groups.
+
+Scanning uses `--batch-size 1000` and periodic document progress at `--progress-every 10` seconds by default, showing documents read and fields still requiring verification. Change these options to adjust request size or reporting; `--progress-every 0` suppresses periodic scan updates. Requests are sequential and an individual slow request may delay a progress message. PIT contexts are closed on completion and on failure. Source verification may need to read every document when a candidate never yields a confirmed date, so there is no sampling limit that could mistake an early time-only page for complete evidence.
 
 ### YAML updates and results
 
-Existing catalog entries retain their order; duplicates are removed and new fields are appended alphabetically. The four excluded paths and fields conclusively established as time-only are removed from existing lists. Unresolved existing entries are preserved and reported, including entries not observed in the selected mappings (`unobserved_existing`); unresolved new fields are not added. Comments, key order and the other YAML sections are preserved with `ruamel.yaml`; serialization can normalize indentation. Configurations with no discovered artifact source are left alone.
+An artifact must have at least one valid discovered date field before its YAML is read, validated or updated. Otherwise its result is `skipped_no_valid_dates`: an existing file is left byte-for-byte unchanged and a missing file is not created. This also leaves old excluded entries untouched and does not reject an invalid YAML file that is being skipped. The report distinguishes no date candidates, only times and unresolved evidence. Existing catalog entries alone do not make an artifact eligible.
 
-Missing files are created with only `forensic_all_dates`, including `forensic_all_dates: []` if no eligible fields were discovered. No processor mappings or other sections are invented. All Elasticsearch discovery and YAML validation complete before any file is written. HTTP errors, timeouts, failed shards and invalid YAML abort before the write phase. File replacement is atomic per file and verified by rereading it; the whole set is not a multi-file transaction, so a filesystem failure during application can leave earlier files updated. Use the Git diff to inspect or revert changes; the script creates no backups.
+For eligible artifacts, existing catalog entries retain their order; duplicates are removed and new fields are appended alphabetically. The four excluded paths and fields conclusively established as time-only are removed from existing lists. Unresolved existing entries are preserved and reported, including entries not observed in the selected mappings (`unobserved_existing`); unresolved new fields are not added. Comments, key order and the other YAML sections are preserved with `ruamel.yaml`. Mapping and sequence indentation are detected separately and retained, as are explicit `---` and `...` document markers. Inconsistent indentation styles within one document cannot be guaranteed. Configurations with no discovered artifact source are left alone.
+
+Missing eligible files are created with only `forensic_all_dates`, using two spaces for mappings and sequence dashes indented by two spaces. No processor mappings or other sections are invented. All Elasticsearch discovery and eligible YAML validation complete before any YAML is written. HTTP errors, timeouts, failed shards and invalid eligible YAML abort before the YAML write phase; completed discovery checkpoints remain available for resume. File replacement is atomic per file and verified by rereading it; the whole set is not a multi-file transaction, so a filesystem failure during application can leave earlier files updated. Use the Git diff to inspect or revert changes; the script creates no backups.
 
 The report identifies added, removed and unresolved fields, created/updated/unchanged files, skipped indices and incomplete coverage. Exit codes are `0` for complete success, `2` for a completed report with unresolved evidence or relevant skips, `1` for an error and `130` for interruption. An incomplete report can still describe valid changes; inspect its coverage details as well as the diff before relying on the catalog.
 
@@ -172,4 +198,4 @@ Run the offline tests from the repository root with the dependency installed:
 python -m unittest discover -s poc
 ```
 
-Tests use simulated Elasticsearch responses and temporary YAML files to cover unions across cases, date/time formats, multi-page verification, source limitations, file creation, preservation, preview, errors, PIT cleanup and idempotence. They do not establish behavior against a live cluster or the real artifact configuration checkout.
+Tests use simulated Elasticsearch responses and temporary YAML files to cover naming with/without a generation, representative selection across cases, empty-index fallback, date/time formats, multi-page verification, source limitations, checkpoint resume and compatibility, progress counters, file creation, indentation/marker preservation, skipping YAML without valid dates, preview, errors, PIT cleanup and idempotence. They do not establish behavior against a live cluster or the real artifact configuration checkout.

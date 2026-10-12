@@ -169,7 +169,7 @@ def original_source_issue(client, index, mapping):
     return None
 
 
-def scan_values(client, index, pending, args, report):
+def scan_values(client, index, pending, args, report, progress=None):
     """Resolve ambiguous candidates; only a complete scan can prove time-only."""
     pit_id = None
     last_progress = monotonic()
@@ -220,8 +220,12 @@ def scan_values(client, index, pending, args, report):
             after = next_after
             now = monotonic()
             if args.progress_every and now - last_progress >= args.progress_every:
-                emit("Progress", {"index": index, "scanned_documents": report["scanned_documents"],
-                                  "unresolved_fields": sum(i["status"] != "date" for i in pending)})
+                remaining = sum(i["status"] != "date" for i in pending)
+                if progress is not None:
+                    progress.show(index=index, unresolved_fields=remaining)
+                else:
+                    emit("Progress", {"index": index, "scanned_documents": report["scanned_documents"],
+                                      "unresolved_fields": remaining})
                 last_progress = now
         for item in pending:
             if item["status"] == "date":
@@ -247,50 +251,243 @@ def scan_values(client, index, pending, args, report):
                     raise exc
 
 
-def discover_catalog(client, args, directory, report):
-    observations = {}
-    entries = concrete_indices(client, args.index_pattern)
-    if not entries:
-        report["complete"] = False
-        emit("Warning", {"reason": "No concrete indices matched"})
+INDEX_NAME = re.compile(
+    r"^ir_data_[0-9a-fA-F]{8}(?:_[0-9a-fA-F]{4}){3}_[0-9a-fA-F]{12}"
+    r"_velociraptor_(?P<artifact>[a-z0-9][a-z0-9_.-]*?)(?:-[0-9]+)?$"
+)
+STATE_VERSION = 1  # Bump when discovery/classification semantics change.
+
+
+def group_indices(entries):
+    groups, skipped = {}, []
     for entry in entries:
-        index = entry["name"]
-        attrs = entry.get("attributes", [])
-        if "system" in attrs or "open" not in attrs:
-            report["indices"].append({"index": index, "status": "skipped",
-                                      "reason": "system" if "system" in attrs else "not open"})
-            continue
+        index, attrs = entry["name"], entry.get("attributes", [])
+        match = INDEX_NAME.fullmatch(index)
+        reason = ("system" if "system" in attrs else "not open" if "open" not in attrs else
+                  "unrecognized index name" if match is None else None)
+        if reason:
+            skipped.append({"index": index, "status": "skipped", "reason": reason})
+        else:
+            groups.setdefault(match["artifact"], []).append(index)
+    return {source: sorted(names) for source, names in sorted(groups.items())}, skipped
+
+
+class Checkpoint:
+    """Persist only completed artifact evidence, never source values or PIT cursors."""
+
+    def __init__(self, args, directory):
+        self.path = Path(args.state_file).expanduser().absolute()
+        if self.path.resolve().parent == directory and self.path.suffix.lower() in (".yaml", ".yml"):
+            raise Error("Checkpoint path must not overwrite an artifact YAML.")
+        parts = urlsplit(args.url)
+        if (parts.scheme not in ("http", "https") or not parts.netloc or parts.username or
+                parts.password or parts.query or parts.fragment):
+            raise Error("Use an HTTP(S) endpoint without credentials or query parameters.")
+        self.binding = {"url": args.url.rstrip("/"), "index_pattern": args.index_pattern,
+                        "artifacts_dir": str(directory)}
+        self.data = None
+        self.check_path()
+        if args.resume:
+            try:
+                self.data = json.loads(self.path.read_text(encoding="utf-8"))
+                self.validate()
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                raise Error("Missing or corrupt checkpoint: " + str(self.path)) from None
+
+    def check_path(self):
+        if (self.path.is_symlink() or not self.path.parent.is_dir() or
+                (self.path.exists() and not self.path.is_file())):
+            raise Error("Checkpoint must be a regular file in an existing directory: " + str(self.path))
+
+    def validate(self):
+        data = self.data
+        if not isinstance(data, dict):
+            raise ValueError("checkpoint root")
+        if data.get("version") != STATE_VERSION:
+            raise Error("Incompatible checkpoint version; start a new scan without --resume.")
+        if data.get("binding") != self.binding:
+            raise Error("Checkpoint endpoint, index pattern or artifact directory differs; start a new scan.")
+        entries, results = data["inventory"], data["results"]
+        if not isinstance(entries, list) or not isinstance(results, dict):
+            raise ValueError("checkpoint collections")
+        names = set()
+        for entry in entries:
+            if (not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or
+                    not isinstance(entry.get("attributes"), list) or
+                    any(not isinstance(attr, str) for attr in entry["attributes"]) or entry["name"] in names):
+                raise ValueError("checkpoint inventory")
+            names.add(entry["name"])
+        groups, _ = group_indices(entries)
+        for source, result in results.items():
+            if source not in groups or not isinstance(result, dict):
+                raise ValueError("checkpoint artifact")
+            artifact = result["artifact"]
+            if not isinstance(artifact, dict):
+                raise ValueError("checkpoint artifact summary")
+            for key in ("fields", "time_only", "unresolved", "mixed", "excluded"):
+                values = artifact[key]
+                if (not isinstance(values, list) or any(not isinstance(v, str) or not v for v in values)
+                        or len(values) != len(set(values))):
+                    raise ValueError("checkpoint field lists")
+            representative = artifact["representative_index"]
+            if representative is not None and representative not in groups[source]:
+                raise ValueError("checkpoint representative")
+            expected = "completed" if artifact["fields"] else "skipped_no_valid_dates"
+            if artifact["status"] != expected or not isinstance(artifact["reason"], str):
+                raise ValueError("checkpoint completion status")
+            if not isinstance(artifact["evidence"], list):
+                raise ValueError("checkpoint evidence")
+            for item in artifact["evidence"]:
+                if (not isinstance(item, dict) or item.get("index") != representative or
+                        item.get("status") not in ("date", "time", "unknown") or
+                        any(not isinstance(item.get(k), str) for k in ("field", "mapped_field", "reason", "format"))):
+                    raise ValueError("checkpoint evidence")
+            indices = result["indices"]
+            if (not isinstance(indices, list) or len(indices) != len(groups[source]) or
+                    {item["index"] for item in indices} != set(groups[source]) or
+                    any(item.get("status") not in ("scanned", "skipped") for item in indices)):
+                raise ValueError("checkpoint index results")
+            if type(result["scanned_documents"]) is not int or result["scanned_documents"] < 0:
+                raise ValueError("checkpoint document count")
+
+    def start(self, entries):
+        self.data = {"version": STATE_VERSION, "binding": self.binding,
+                     "inventory": entries, "results": {}}
+        self.save()
+
+    def save(self):
+        self.check_path()
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=self.path.parent, prefix=".artifact-dates-state-",
+                                             suffix=".tmp", delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write((json.dumps(self.data, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+
+class Progress:
+    def __init__(self, report, total, recovered):
+        self.report, self.total, self.recovered = report, total, recovered
+        self.artifact = None
+        self.current_empty_indices = 0
+        self.context = None
+        self.tty = sys.stderr.isatty()
+        self.active_line = False
+
+    def show(self, source=None, index=None, unresolved_fields=None, finished=False):
+        if source is not None:
+            self.artifact = source
+        report = self.report
+        completed = len(report["artifacts"])
+        value = {"completed_artifacts": completed, "total_artifacts": self.total,
+                 "percent": round(100 * completed / self.total, 1) if self.total else 100.0,
+                 "current_artifact": self.artifact, "current_index": index,
+                 "recovered_artifacts": self.recovered,
+                 "duplicate_indices": sum(i.get("reason") == "duplicate artifact" for i in report["indices"]),
+                 "empty_indices": (self.current_empty_indices +
+                                   sum(i.get("reason") == "empty index" for i in report["indices"])),
+                 "skipped_no_valid_dates": sum(a["status"] == "skipped_no_valid_dates"
+                                               for a in report["artifacts"].values()),
+                 "scanned_documents": report["scanned_documents"]}
+        if unresolved_fields is not None:
+            value["unresolved_fields"] = unresolved_fields
+        report["progress"] = value
+        if self.tty:
+            context = (self.artifact, index)
+            if index is not None and context != self.context:
+                self.close()
+                print(f"Artifact: {self.artifact}\nIndex: {index}", file=sys.stderr, flush=True)
+                self.context = context
+            line = (f"Artifacts {completed}/{self.total} ({value['percent']:g}%) | "
+                    f"resumed:{self.recovered} dup:{value['duplicate_indices']} "
+                    f"empty:{value['empty_indices']} no-dates:{value['skipped_no_valid_dates']} "
+                    f"docs:{value['scanned_documents']}")
+            if unresolved_fields is not None:
+                line += f" pending:{unresolved_fields}"
+            try:
+                width = max(1, os.get_terminal_size(sys.stderr.fileno()).columns - 1)
+            except (OSError, AttributeError):
+                width = 119
+            # Long index names are printed once above the progress line, so
+            # periodic updates never wrap and leave stale rows on the terminal.
+            if len(line) > width:
+                line = line[:max(0, width - 1)] + "…"
+            print("\r\033[2K" + line, end="\n" if finished else "", file=sys.stderr, flush=True)
+            self.active_line = not finished
+        else:
+            print("Progress: " + json.dumps(value, ensure_ascii=False), file=sys.stderr, flush=True)
+
+    def close(self):
+        if self.active_line:
+            print(file=sys.stderr, flush=True)
+            self.active_line = False
+
+
+def summarize_candidates(candidates, excluded, representative):
+    by_field = {}
+    evidence = [{k: v for k, v in item.items() if k != "parser"} for item in candidates]
+    for item in evidence:
+        by_field.setdefault(item["field"], []).append(item)
+    summary = {"fields": [], "time_only": [], "unresolved": [], "mixed": [],
+               "excluded": sorted(excluded), "evidence": evidence,
+               "representative_index": representative}
+    for field, items in sorted(by_field.items()):
+        statuses = {item["status"] for item in items}
+        bucket = "fields" if "date" in statuses else "time_only" if statuses == {"time"} else "unresolved"
+        summary[bucket].append(field)
+        if any(item["saw_date"] for item in items) and any(item["saw_time"] for item in items):
+            summary["mixed"].append(field)
+    summary["status"] = "completed" if summary["fields"] else "skipped_no_valid_dates"
+    summary["reason"] = ("valid dates found" if summary["fields"] else
+                         "all indices empty" if representative is None else
+                         "unresolved" if summary["unresolved"] else
+                         "only_times" if summary["time_only"] else "no_candidates")
+    return summary
+
+
+def discover_artifact(client, args, source, indices, report, progress):
+    statuses, candidates, excluded = [], [], set(EXCLUDED)
+    representative = None
+    before = report["scanned_documents"]
+    for position, index in enumerate(indices):
+        progress.current_empty_indices = len(statuses)
+        progress.show(source=source, index=index)
         path = "/" + quote(index, safe="")
-        mappings = client.request("GET", path + "/_mapping")
-        if set(mappings) != {index}:
-            raise Error("Unexpected mapping response for concrete index " + index)
-        mapping = mappings[index]["mappings"]
         identity = client.request("POST", path + "/_search?allow_partial_search_results=false",
                                   {"size": 1, "track_total_hits": False, "sort": ["_doc"],
                                    "query": {"match_all": {}}, "_source": ["artifact_source"]})
         check_search(identity)
         hits = identity["hits"]["hits"]
-        if not hits or not isinstance(hits[0].get("_source"), dict) or "artifact_source" not in hits[0]["_source"]:
-            report["indices"].append({"index": index, "status": "skipped",
-                                      "reason": "empty index" if not hits else "artifact_source unavailable"})
-            report["complete"] = False
+        if not hits:
+            statuses.append({"index": index, "status": "skipped", "reason": "empty index"})
             continue
-        if hits[0].get("_index") != index:
+        hit = hits[0]
+        if hit.get("_index") != index:
             raise Error("Artifact identity search returned an unexpected index.")
-        source = hits[0]["_source"]["artifact_source"]
-        artifact_path(directory, source)
-        artifact = observations.setdefault(source, {"evidence": [], "excluded": set(EXCLUDED)})
-        candidates = []
+        if not isinstance(hit.get("_source"), dict) or "artifact_source" not in hit["_source"]:
+            raise Error("artifact_source unavailable in nonempty index " + index)
+        if hit["_source"]["artifact_source"] != source:
+            raise Error("artifact_source does not match the artifact in index name: " + index)
+        representative = index
+        mappings = client.request("GET", path + "/_mapping")
+        if set(mappings) != {index}:
+            raise Error("Unexpected mapping response for concrete index " + index)
+        mapping = mappings[index]["mappings"]
         for mapped, original, spec in mapped_dates(mapping):
             if original in EXCLUDED:
-                artifact["excluded"].add(mapped)
+                excluded.add(mapped)
                 continue
             parser = DateFormat(spec.get("format"), spec["type"])
-            item = {"index": index, "mapped_field": mapped, "field": original, "parser": parser,
-                    "format": parser.format_string, "unsupported_formats": parser.unsupported_formats,
-                    "status": parser.kind, "reason": "mapping format", "saw_time": parser.kind == "time",
-                    "saw_date": parser.kind == "date", "saw_unknown": False}
-            candidates.append(item)
+            candidates.append({"index": index, "mapped_field": mapped, "field": original, "parser": parser,
+                               "format": parser.format_string, "unsupported_formats": parser.unsupported_formats,
+                               "status": parser.kind, "reason": "mapping format", "saw_time": parser.kind == "time",
+                               "saw_date": parser.kind == "date", "saw_unknown": False})
         pending = [item for item in candidates if item["status"] == "unknown"]
         if pending:
             issue = original_source_issue(client, index, mapping)
@@ -298,31 +495,51 @@ def discover_catalog(client, args, directory, report):
                 for item in pending:
                     item["reason"] = issue
             else:
-                scan_values(client, index, pending, args, report)
-        artifact["evidence"].extend({k: v for k, v in item.items() if k != "parser"} for item in candidates)
-        report["indices"].append({"index": index, "status": "scanned", "artifact_source": source})
-        emit("Index", {"index": index, "artifact_source": source, "date_candidates": len(candidates)})
-    for source, artifact in sorted(observations.items()):
-        by_field = {}
-        for item in artifact["evidence"]:
-            by_field.setdefault(item["field"], []).append(item)
-        summary = {"fields": [], "time_only": [], "unresolved": [], "mixed": [],
-                   "excluded": sorted(artifact["excluded"]), "evidence": artifact["evidence"]}
-        for field, items in sorted(by_field.items()):
-            statuses = {item["status"] for item in items}
-            if "date" in statuses:
-                summary["fields"].append(field)
-            elif statuses == {"time"}:
-                summary["time_only"].append(field)
-            else:
-                summary["unresolved"].append(field)
-                report["complete"] = False
-            if any(item["saw_date"] for item in items) and any(item["saw_time"] for item in items):
-                summary["mixed"].append(field)
-        report["artifacts"][source] = summary
+                scan_values(client, index, pending, args, report, progress)
+        statuses.append({"index": index, "status": "scanned", "artifact_source": source})
+        statuses.extend({"index": duplicate, "status": "skipped", "reason": "duplicate artifact",
+                         "artifact_source": source, "representative_index": index}
+                        for duplicate in indices[position + 1:])
+        break
+    return {"artifact": summarize_candidates(candidates, excluded, representative), "indices": statuses,
+            "scanned_documents": report["scanned_documents"] - before}
 
 
-def yaml_handler():
+def discover_catalog(client, args, directory, report):
+    checkpoint = Checkpoint(args, directory)
+    entries = checkpoint.data["inventory"] if args.resume else concrete_indices(client, args.index_pattern)
+    groups, skipped = group_indices(entries)
+    if not args.resume:
+        checkpoint.start(entries)
+    report["state_file"] = str(checkpoint.path)
+    report["indices"].extend(skipped)
+    if not groups:
+        report["complete"] = False
+        emit("Warning", {"reason": "No eligible artifact indices matched"})
+    for source, result in checkpoint.data["results"].items():
+        report["artifacts"][source] = copy.deepcopy(result["artifact"])
+        report["indices"].extend(result["indices"])
+        report["scanned_documents"] += result["scanned_documents"]
+    progress = Progress(report, len(groups), len(checkpoint.data["results"]))
+    try:
+        progress.show()
+        for source, indices in groups.items():
+            if source in checkpoint.data["results"]:
+                continue
+            result = discover_artifact(client, args, source, indices, report, progress)
+            checkpoint.data["results"][source] = result
+            checkpoint.save()
+            report["artifacts"][source] = result["artifact"]
+            report["indices"].extend(result["indices"])
+            progress.current_empty_indices = 0
+            progress.show(source=source, index=result["artifact"]["representative_index"], finished=True)
+        if any(a["unresolved"] or a["representative_index"] is None for a in report["artifacts"].values()):
+            report["complete"] = False
+    finally:
+        progress.close()
+
+
+def yaml_handler(original_text=None):
     try:
         from ruamel.yaml import YAML
     except ImportError:
@@ -331,6 +548,62 @@ def yaml_handler():
     yaml.preserve_quotes = True
     yaml.allow_duplicate_keys = False
     yaml.width = 4096
+    yaml._artifact_preamble = ""
+    yaml._artifact_epilogue = None
+    mapping_indent, sequence_indent, sequence_offset = 2, 4, 2
+    if original_text is not None:
+        from ruamel.yaml.events import DocumentStartEvent, DocumentEndEvent
+        from ruamel.yaml.nodes import MappingNode, SequenceNode
+
+        # Round-trip YAML preserves comments, but indentation and document markers
+        # are emitter settings. Infer mapping and sequence spacing independently:
+        # a sequence's content column includes both its dash offset and "- ".
+        for event in yaml.parse(original_text):
+            if isinstance(event, DocumentStartEvent):
+                yaml.explicit_start = event.explicit
+                if event.explicit:
+                    # ruamel does not retain comments preceding an explicit marker.
+                    yaml._artifact_preamble = original_text[:event.start_mark.index]
+            elif isinstance(event, DocumentEndEvent):
+                yaml.explicit_end = event.explicit
+                if event.explicit:
+                    yaml._artifact_epilogue = original_text[event.end_mark.index:]
+        root = yaml.compose(original_text)
+        mapping_steps, sequence_styles, visited = [], [], set()
+
+        def inspect(node):
+            if id(node) in visited:
+                return
+            visited.add(id(node))  # YAML aliases can form cycles.
+            if isinstance(node, MappingNode):
+                for key, value in node.value:
+                    if not node.flow_style and value.start_mark.line > key.start_mark.line:
+                        offset = value.start_mark.column - key.start_mark.column
+                        if isinstance(value, MappingNode) and not value.flow_style and offset > 0:
+                            mapping_steps.append(offset)
+                        elif isinstance(value, SequenceNode) and not value.flow_style and offset >= 0:
+                            # Empty/flow sequences do not provide block-style evidence.
+                            if value.value:
+                                first = value.value[0]
+                                width = first.start_mark.column - key.start_mark.column
+                                if first.start_mark.line >= value.start_mark.line and width >= offset + 2:
+                                    sequence_styles.append((width, offset))
+                    inspect(value)
+            elif isinstance(node, SequenceNode):
+                for value in node.value:
+                    inspect(value)
+
+        if root is not None:
+            inspect(root)
+        if mapping_steps:
+            mapping_indent = max(dict.fromkeys(mapping_steps), key=mapping_steps.count)
+        if sequence_styles:
+            sequence_indent, sequence_offset = max(dict.fromkeys(sequence_styles), key=sequence_styles.count)
+        # Preserve uniform line endings. Mixed endings follow their first occurrence.
+        line_break = re.search(r"\r\n|\n|\r", original_text)
+        if line_break:
+            yaml.line_break = line_break.group()
+    yaml.indent(mapping=mapping_indent, sequence=sequence_indent, offset=sequence_offset)
     return yaml
 
 
@@ -338,7 +611,7 @@ def yaml_handler():
 class FileChange:
     path: Path
     original: object
-    updated: bytes
+    updated: object
     mode: int
     summary: dict
 
@@ -350,6 +623,16 @@ def plan_files(directory, artifacts):
     changes = []
     targets = set()
     for source, artifact in artifacts.items():
+        if not artifact["fields"]:
+            # Do not open or validate a YAML which discovery cannot enrich.
+            path = directory / (source + ".yaml")
+            reason = ("unresolved" if artifact["unresolved"] else
+                      "only_times" if artifact["time_only"] else "no_candidates")
+            summary = {"path": str(path), "status": "skipped_no_valid_dates", "reason": reason,
+                       "added": [], "removed": [], "fields": [],
+                       "unresolved": list(artifact["unresolved"]), "unobserved_existing": []}
+            changes.append(FileChange(path, None, None, 0, summary))
+            continue
         path = artifact_path(directory, source)
         # Refuse case-fold collisions on portable/case-insensitive checkouts.
         key = path.name.casefold()
@@ -357,9 +640,12 @@ def plan_files(directory, artifacts):
             raise Error("Artifact names collide as filenames: " + path.name)
         targets.add(key)
         original = path.read_bytes() if path.exists() else None
-        yaml = yaml_handler()
         try:
-            data = yaml.load(original.decode("utf-8")) if original is not None else CommentedMap()
+            original_text = original.decode("utf-8") if original is not None else None
+            yaml = yaml_handler(original_text)
+            # Comment tokens otherwise retain CR and the CRLF emitter adds it again.
+            load_text = re.sub(r"\r\n|\r", "\n", original_text) if original is not None else None
+            data = yaml.load(load_text) if original is not None else CommentedMap()
         except (YAMLError, UnicodeError):
             raise Error("Invalid UTF-8 YAML: " + str(path)) from None
         if not isinstance(data, dict):
@@ -385,8 +671,14 @@ def plan_files(directory, artifacts):
             before_other = {key: copy.deepcopy(value) for key, value in data.items() if key != TARGET}
             data[TARGET] = values
             output = io.StringIO()
+            output.write(yaml._artifact_preamble)
             yaml.dump(data, output)
-            updated = output.getvalue().encode("utf-8")
+            rendered = output.getvalue()
+            if yaml._artifact_epilogue is not None:
+                rendered = rendered.rstrip("\r\n") + yaml._artifact_epilogue
+            # Standalone comment tokens can bypass the emitter's line_break setting.
+            rendered = re.sub(r"\r\n|\r|\n", lambda _: yaml.line_break or "\n", rendered)
+            updated = rendered.encode("utf-8")
             checked = yaml.load(updated.decode("utf-8"))
             if list(checked[TARGET]) != list(values) or {k: v for k, v in checked.items() if k != TARGET} != before_other:
                 raise Error("YAML round-trip changed unrelated content: " + str(path))
@@ -415,6 +707,7 @@ def check_unchanged(change):
 
 
 def apply_files(changes):
+    changes = [change for change in changes if change.summary["status"] != "skipped_no_valid_dates"]
     # Validate every file before the first write; each replacement is atomic.
     for change in changes:
         check_unchanged(change)
@@ -490,6 +783,10 @@ def parse_args(argv=None):
     parser.add_argument("--index-pattern", default="*")
     parser.add_argument("--batch-size", type=int, default=1000)
     parser.add_argument("--progress-every", type=int, default=10)
+    parser.add_argument("--state-file", default=os.environ.get(
+        "ARTIFACT_DATES_STATE", ".discover-artifact-dates.state.json"),
+        help="Checkpoint path (default: ARTIFACT_DATES_STATE or .discover-artifact-dates.state.json)")
+    parser.add_argument("--resume", action="store_true", help="Reuse completed artifacts from the checkpoint")
     parser.add_argument("--apply", action="store_true", help="Write local YAML files without backups")
     args = parser.parse_args(argv)
     if not args.artifacts_dir or not Path(args.artifacts_dir).expanduser().is_dir():
@@ -506,7 +803,8 @@ def main(argv=None):
         print("ERROR: " + str(exc), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("Interrupted. Any local file replacements already completed remain applied.", file=sys.stderr)
+        print("Interrupted. Use --resume with the same options to recover completed artifacts. "
+              "Any local file replacements already completed remain applied.", file=sys.stderr)
         return 130
 
 
