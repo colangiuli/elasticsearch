@@ -101,3 +101,75 @@ If the panel already lets you choose its temporal field, try `forensic_all_dates
 - The local checks use a simulated ES client to validate source-string preservation, indexed-date validation, payloads, pagination and failure handling. No live Elasticsearch cluster or your Kibana fork was available for execution; first run the preview in your development environment.
 
 Primary references: [formatted doc values](https://www.elastic.co/guide/en/elasticsearch/reference/8.19/search-fields.html#docvalue-fields), [partial updates](https://www.elastic.co/guide/en/elasticsearch/reference/8.19/docs-update.html), [bulk requests](https://www.elastic.co/guide/en/elasticsearch/reference/8.19/docs-bulk.html), [point in time](https://www.elastic.co/guide/en/elasticsearch/reference/8.19/point-in-time-api.html).
+
+## Discover date fields for artifact configuration files
+
+`discover_artifact_dates.py` builds the `forensic_all_dates` field catalog in local artifact YAML files. It reads Elasticsearch mappings and, where necessary, original document values. It makes no document, mapping or index-setting changes. Its `--apply` option writes only local YAML files, without backups or automatic Git operations.
+
+### Install and run
+
+The discovery script requires Python 3.9 or newer and `ruamel.yaml`. From the repository root, install its dependency in your existing virtual environment, or create a dedicated one:
+
+```bash
+python3 -m venv .venv-discovery
+. .venv-discovery/bin/activate
+python -m pip install -r poc/requirements-discovery.txt
+```
+
+Set the Elasticsearch endpoint and the existing artifact configuration directory:
+
+```bash
+export ES_URL='https://your-development-elasticsearch:9200'
+export ARTIFACTS_DIR='/path/to/collections_processor/src/processor/conf/velociraptor/artifacts'
+```
+
+Authentication follows the backfill script: set `ES_API_KEY` to an encoded Elasticsearch API key, or set both `ES_USERNAME` and `ES_PASSWORD`. For a private certificate authority, set `ES_CA_CERT` to its PEM file path. Supply credentials through your normal environment or secret mechanism. The account needs permission to resolve indices, read mappings/settings, search documents, and open/close point-in-time search contexts.
+
+Preview the proposed YAML differences without writing files:
+
+```bash
+python poc/discover_artifact_dates.py
+```
+
+Apply the changes, or optionally limit the indices and override `ARTIFACTS_DIR`:
+
+```bash
+python poc/discover_artifact_dates.py --apply
+
+python poc/discover_artifact_dates.py \
+  --index-pattern 'ir_data_*_velociraptor_*' \
+  --artifacts-dir '/another/checkout/src/processor/conf/velociraptor/artifacts' \
+  --apply
+```
+
+`--artifacts-dir` takes precedence over `ARTIFACTS_DIR`. One must be supplied, and the directory must already exist. The default `--index-pattern '*'` examines concrete open indices, including hidden non-system indices, once each; closed and system indices are reported as excluded. Aliases do not cause duplicate processing. Narrowing the pattern also narrows the evidence available for deciding that a field contains only times.
+
+### Discovery and date versus time handling
+
+Each index is assumed to contain one artifact source and one case. The script reads `artifact_source` from the original `_source` of one document and merges discoveries for the same artifact across indices and cases. For example, `artifact_source: mft` selects exactly `mft.yaml`; the artifact is never inferred from the index name. Empty indices and missing artifact sources are reported as skipped. Invalid names or paths escaping the configured directory are rejected.
+
+The catalog includes physical `date` and `date_nanos` fields inside objects and `nested` structures. A date multifield contributes its parent path in `_source`, not the multifield name. Runtime fields, aliases, scripted date fields and the four root source paths `acquisition_time`, `collection_time`, `@timestamp` and `forensic_all_dates` are excluded. The same exclusions apply to multifields sourced from those paths. This discovery script does not impose the backfill script's doc-values or 100-field restrictions.
+
+Mapping formats distinguish dates, epochs and time-only values. Mixed or unclassified formats require inspecting original `_source` values; doc values are not used to infer dates because Elasticsearch can attach a date to a time-only input. The script scans with PIT and `search_after`, including later pages, until every unresolved candidate has a confirmed date or the index is exhausted. One confirmed date in any relevant index makes the field eligible. A field is established as time-only only with time evidence and no date or unclassifiable evidence across the relevant indices. Null, empty and missing values prove neither case. Unsupported format syntax is reported rather than guessed. Mixed date/time observations are reported; filtering individual values remains the processor's responsibility.
+
+Source values can come from nested objects, arrays or literal keys containing dots. Disabled, synthetic or pruned `_source` cannot provide reliable original-value evidence where that evidence is needed; these cases are reported as unresolved. Discovery based on unambiguous mapping formats does not need to scan every document. No date-like string outside a `date` or `date_nanos` mapping is added.
+
+Value recognition supports common numeric calendar patterns (for example `yyyy-MM-dd`, `dd/MM/yyyy`, `yyyyMMdd`), ISO dates, ordinal/week built-in formats, numeric times, fractions, offsets, quoted literals and optional sections. It is deliberately not a complete Java `DateTimeFormatter` implementation: locale names, named zones and advanced custom tokens remain unresolved. Calendar validation covers years 1–9999; valid Elasticsearch representations outside the supported subset can also remain unresolved. Format alternatives are tried in their declared order, so a numeric clock string is not automatically treated as an epoch. The evidence report includes the mapping format and any unsupported alternatives.
+
+Scanning uses `--batch-size 1000` and reports progress at `--progress-every 10` seconds by default. Change these options to adjust request size or reporting; `--progress-every 0` suppresses periodic progress. Requests are sequential and an individual slow request may delay a progress message. PIT contexts are closed on completion and on failure. Source verification may need to read every document when a candidate never yields a confirmed date, so there is no sampling limit that could mistake an early time-only page for complete evidence.
+
+### YAML updates and results
+
+Existing catalog entries retain their order; duplicates are removed and new fields are appended alphabetically. The four excluded paths and fields conclusively established as time-only are removed from existing lists. Unresolved existing entries are preserved and reported, including entries not observed in the selected mappings (`unobserved_existing`); unresolved new fields are not added. Comments, key order and the other YAML sections are preserved with `ruamel.yaml`; serialization can normalize indentation. Configurations with no discovered artifact source are left alone.
+
+Missing files are created with only `forensic_all_dates`, including `forensic_all_dates: []` if no eligible fields were discovered. No processor mappings or other sections are invented. All Elasticsearch discovery and YAML validation complete before any file is written. HTTP errors, timeouts, failed shards and invalid YAML abort before the write phase. File replacement is atomic per file and verified by rereading it; the whole set is not a multi-file transaction, so a filesystem failure during application can leave earlier files updated. Use the Git diff to inspect or revert changes; the script creates no backups.
+
+The report identifies added, removed and unresolved fields, created/updated/unchanged files, skipped indices and incomplete coverage. Exit codes are `0` for complete success, `2` for a completed report with unresolved evidence or relevant skips, `1` for an error and `130` for interruption. An incomplete report can still describe valid changes; inspect its coverage details as well as the diff before relying on the catalog.
+
+Run the offline tests from the repository root with the dependency installed:
+
+```bash
+python -m unittest discover -s poc
+```
+
+Tests use simulated Elasticsearch responses and temporary YAML files to cover unions across cases, date/time formats, multi-page verification, source limitations, file creation, preservation, preview, errors, PIT cleanup and idempotence. They do not establish behavior against a live cluster or the real artifact configuration checkout.
